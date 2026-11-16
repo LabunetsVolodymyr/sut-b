@@ -33,7 +33,7 @@ class EnrollmentService:
         integer(age, 14, 100)
         integer(entry_score, 0, 100)
         integer(level, 1, 3)
-        return level == 1 or (level == 2 and entry_score >= 60) or (level == 3 and age >= 18 and entry_score >= 80)
+        return level == 1 or (level == 2 and entry_score >= 61) or (level == 3 and age >= 18 and entry_score >= 80)
 
     def calculate_refund(self, prepaid, days_before_start):
         integer(prepaid, 0, 10000000)
