@@ -1,0 +1,188 @@
+# CI pipeline для SUT B (варіант 12).
+# Trigger: кожен push і pull request у main, а також ручний запуск.
+# Stages (jobs): build -> unit-tests -> integration-tests + api-tests.
+# Кожен тестовий job публікує JUnit test report і зберігає XML як artifact.
+# Падіння тесту = ненульовий код pytest = червоний job і червоний pipeline.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write          # для публікації test report у вкладці Checks
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # ---------------------------------------------------------------- BUILD --
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip build
+          python -m pip install -e ".[test]"
+          python -m pip check
+
+      - name: Compile sources (syntax check)
+        run: python -m compileall -q courses tests
+
+      - name: Import application
+        run: python -c "from courses.api import app; print('routes:', len(app.routes))"
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  # ----------------------------------------------------------- UNIT TESTS --
+  unit-tests:
+    name: Unit tests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: python -m pip install -e ".[test]"
+
+      - name: Run unit tests
+        run: >
+          python -m pytest tests/test_unit.py -v
+          --junitxml=test-results/unit.xml -o junit_family=xunit2
+
+      - name: Publish test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: test-results/unit.xml
+          check_name: Unit test report
+          detailed_summary: true
+          include_passed: true
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: test-results/
+
+  # ---------------------------------------------------- INTEGRATION TESTS --
+  integration-tests:
+    name: Integration tests (PostgreSQL + WireMock)
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    services:
+      # Локальна БД для test_environment.py і test_integration.py
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: courses_student
+          POSTGRES_PASSWORD: student123
+          POSTGRES_DB: courses_variant12_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U courses_student"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_NAME: courses_variant12_test
+      DB_USER: courses_student
+      DB_PASSWORD: student123
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: python -m pip install -e ".[test]"
+
+      - name: Apply migration
+        env:
+          PGPASSWORD: student123
+        run: psql -h localhost -U courses_student -d courses_variant12_test -v ON_ERROR_STOP=1 -f migrations/V1__create_tables.sql
+
+      # test_testcontainers.py сам піднімає PostgreSQL і WireMock через Docker раннера
+      - name: Run integration tests
+        run: >
+          python -m pytest tests/test_environment.py tests/test_integration.py tests/test_testcontainers.py -v
+          --junitxml=test-results/integration.xml -o junit_family=xunit2
+
+      - name: Publish test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: test-results/integration.xml
+          check_name: Integration test report
+          detailed_summary: true
+          include_passed: true
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: test-results/
+
+  # ------------------------------------------------------------ API TESTS --
+  api-tests:
+    name: REST API tests
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: python -m pip install -e ".[test]"
+
+      # Фікстури піднімають PostgreSQL у Docker і справжній uvicorn на вільному порту
+      - name: Run REST API tests
+        run: >
+          python -m pytest tests/test_rest_api.py -v
+          --junitxml=test-results/api.xml -o junit_family=xunit2
+
+      - name: Publish test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: test-results/api.xml
+          check_name: API test report
+          detailed_summary: true
+          include_passed: true
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-results
+          path: test-results/
