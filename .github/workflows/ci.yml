@@ -1,58 +1,92 @@
-# CI pipeline для SUT B (варіант 12).
-# Trigger: кожен push і pull request у main, а також ручний запуск.
-# Stages (jobs): build -> unit-tests -> integration-tests + api-tests.
-# Кожен тестовий job публікує JUnit test report і зберігає XML як artifact.
-# Падіння тесту = ненульовий код pytest = червоний job і червоний pipeline.
+# =============================================================================
+# CI pipeline для SUT B (варіант 12) — GitHub Actions
+#
+# CI (Continuous Integration) — автоматичне збирання та тестування коду
+# після кожної зміни в репозиторії.
+#
+# Структура pipeline (jobs і порядок їх виконання):
+#
+#   build ──► unit-tests ──┬──► integration-tests
+#                          └──► api-tests
+#
+# - Якщо будь-який job падає, pipeline отримує статус Failure (червоний).
+# - Наступні jobs, що залежать від нього (needs), не запускаються (skipped).
+# - Помилки НЕ приховуються: немає continue-on-error і "|| true".
+# - Кожен тестовий job публікує test report (JUnit XML) і зберігає його
+#   як artifact, навіть якщо тести впали.
+# =============================================================================
 
+# Назва workflow, яку видно на вкладці Actions
 name: CI
 
+# -----------------------------------------------------------------------------
+# TRIGGER — події, які автоматично запускають pipeline
+# -----------------------------------------------------------------------------
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+  push:                    # кожен git push ...
+    branches: [main]       # ... у гілку main
+  pull_request:            # кожен pull request ...
+    branches: [main]       # ... у гілку main
+  workflow_dispatch:       # додатково: ручний запуск кнопкою "Run workflow"
 
+# Права токена GITHUB_TOKEN для цього workflow
 permissions:
-  contents: read
-  checks: write          # для публікації test report у вкладці Checks
+  contents: read           # читати код репозиторію
+  checks: write            # публікувати test report у вкладці Checks
 
+# Якщо в ту саму гілку прийшов новий push, поки старий запуск ще йде,
+# старий запуск скасовується (Cancelled), щоб не витрачати час runner'а
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Змінні середовища, спільні для всіх jobs
 env:
   PYTHON_VERSION: "3.12"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
+# -----------------------------------------------------------------------------
+# JOBS (stages) — етапи pipeline
+# Кожен job виконується на окремому RUNNER (чиста віртуальна машина GitHub)
+# і складається з послідовних кроків (steps)
+# -----------------------------------------------------------------------------
 jobs:
-  # ---------------------------------------------------------------- BUILD --
+
+  # ===================================================================== BUILD
+  # Етап 1: встановлення залежностей, перевірка коду і збирання пакета
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest           # RUNNER: віртуальна машина Ubuntu від GitHub
     steps:
+      # Завантажити код репозиторію на runner
       - uses: actions/checkout@v4
 
+      # Встановити Python потрібної версії (з кешем pip для швидкості)
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
+      # Встановити проєкт і тестові залежності; pip check — перевірка сумісності
       - name: Install project and test dependencies
         run: |
           python -m pip install --upgrade pip build
           python -m pip install -e ".[test]"
           python -m pip check
 
+      # Скомпілювати всі .py файли — падає при синтаксичній помилці
       - name: Compile sources (syntax check)
         run: python -m compileall -q courses tests
 
+      # Імпортувати FastAPI-застосунок — падає, якщо зламані імпорти
       - name: Import application
         run: python -c "from courses.api import app; print('routes:', len(app.routes))"
 
+      # Зібрати пакет (wheel + sdist) у папку dist/
       - name: Build wheel and sdist
         run: python -m build
 
+      # ARTIFACT: зберегти зібраний пакет, його можна завантажити зі сторінки запуску
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -60,10 +94,12 @@ jobs:
           path: dist/
           retention-days: 7
 
-  # ----------------------------------------------------------- UNIT TESTS --
+  # ================================================================ UNIT TESTS
+  # Етап 2: швидкі тести бізнес-логіки без БД, Docker і мережі
+  # (репозиторії замінені in-memory test doubles)
   unit-tests:
     name: Unit tests
-    needs: build
+    needs: build                     # запускається лише після успішного Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,11 +109,15 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[test]"
 
+      # Запуск тестів; --junitxml зберігає результат у форматі JUnit XML.
+      # Якщо хоч один тест впав, pytest повертає ненульовий код -> job червоний
       - name: Run unit tests
         run: >
           python -m pytest tests/test_unit.py -v
           --junitxml=test-results/unit.xml -o junit_family=xunit2
 
+      # TEST REPORT: показати результати тестів у Summary і вкладці Checks.
+      # if: !cancelled() — виконується і тоді, коли тести впали
       - name: Publish test report
         if: ${{ !cancelled() }}
         uses: mikepenz/action-junit-report@v5
@@ -87,6 +127,7 @@ jobs:
           detailed_summary: true
           include_passed: true
 
+      # ARTIFACT: зберегти XML-файл з результатами тестів
       - name: Upload test results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -94,13 +135,16 @@ jobs:
           name: unit-test-results
           path: test-results/
 
-  # ---------------------------------------------------- INTEGRATION TESTS --
+  # ========================================================= INTEGRATION TESTS
+  # Етап 3а: сервіс + справжні репозиторії + справжня PostgreSQL;
+  # HTTP-політика перевіряється через WireMock (Testcontainers)
   integration-tests:
     name: Integration tests (PostgreSQL + WireMock)
-    needs: unit-tests
+    needs: unit-tests                # запускається лише після успішних unit-тестів
     runs-on: ubuntu-latest
+
+    # Service container: GitHub запускає PostgreSQL поруч із job'ом
     services:
-      # Локальна БД для test_environment.py і test_integration.py
       postgres:
         image: postgres:17
         env:
@@ -108,15 +152,19 @@ jobs:
           POSTGRES_PASSWORD: student123
           POSTGRES_DB: courses_variant12_test
         ports: ["5432:5432"]
+        # Чекати, поки БД буде готова приймати з'єднання
         options: >-
           --health-cmd "pg_isready -U courses_student"
           --health-interval 5s --health-timeout 5s --health-retries 10
+
+    # Параметри підключення, які читає courses/database.py
     env:
       DB_HOST: localhost
       DB_PORT: "5432"
       DB_NAME: courses_variant12_test
       DB_USER: courses_student
       DB_PASSWORD: student123
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -125,17 +173,20 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[test]"
 
+      # Створити таблиці в порожній БД
       - name: Apply migration
         env:
           PGPASSWORD: student123
         run: psql -h localhost -U courses_student -d courses_variant12_test -v ON_ERROR_STOP=1 -f migrations/V1__create_tables.sql
 
-      # test_testcontainers.py сам піднімає PostgreSQL і WireMock через Docker раннера
+      # test_environment.py, test_integration.py — з service-контейнером PostgreSQL;
+      # test_testcontainers.py сам піднімає PostgreSQL і WireMock через Docker runner'а
       - name: Run integration tests
         run: >
           python -m pytest tests/test_environment.py tests/test_integration.py tests/test_testcontainers.py -v
           --junitxml=test-results/integration.xml -o junit_family=xunit2
 
+      # TEST REPORT
       - name: Publish test report
         if: ${{ !cancelled() }}
         uses: mikepenz/action-junit-report@v5
@@ -145,6 +196,7 @@ jobs:
           detailed_summary: true
           include_passed: true
 
+      # ARTIFACT
       - name: Upload test results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
@@ -152,10 +204,12 @@ jobs:
           name: integration-test-results
           path: test-results/
 
-  # ------------------------------------------------------------ API TESTS --
+  # ================================================================= API TESTS
+  # Етап 3б: тести REST API через справжні HTTP-запити.
+  # Виконується паралельно з integration-tests
   api-tests:
     name: REST API tests
-    needs: unit-tests
+    needs: unit-tests                # запускається лише після успішних unit-тестів
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -165,12 +219,14 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[test]"
 
-      # Фікстури піднімають PostgreSQL у Docker і справжній uvicorn на вільному порту
+      # Фікстури піднімають PostgreSQL у Docker (Testcontainers)
+      # і справжній сервер uvicorn на вільному порту
       - name: Run REST API tests
         run: >
           python -m pytest tests/test_rest_api.py -v
           --junitxml=test-results/api.xml -o junit_family=xunit2
 
+      # TEST REPORT
       - name: Publish test report
         if: ${{ !cancelled() }}
         uses: mikepenz/action-junit-report@v5
@@ -180,6 +236,7 @@ jobs:
           detailed_summary: true
           include_passed: true
 
+      # ARTIFACT
       - name: Upload test results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
